@@ -45,8 +45,8 @@ import re
 from pathlib import Path
 from lxml import etree as ET
 
-INPUT_PPTX = "input3.pptx"
-OUTPUT_PPTX = "output3.pptx"
+INPUT_PPTX = "input.pptx"
+OUTPUT_PPTX = "output.pptx"
 
 NS = {
     "p": "http://schemas.openxmlformats.org/presentationml/2006/main",
@@ -63,13 +63,23 @@ NS = {
 # --------------------------------------------------------------------------- #
 def next_numeric_id(existing, prefix="rId"):
     """
-    Return 'prefixX' where X is 1 + max numeric suffix of strings in *existing*.
+    既存のIDリストから最大の数値部分を探し、1増やした新しいID文字列を返す。
+    例: ["rId1", "rId2"] → "rId3"
     """
     nums = [int(re.sub(r"\D", "", s)) for s in existing if re.sub(r"\D", "", s)]
     return f"{prefix}{max(nums, default=0) + 1}"
 
 
 def collect_shapes(slide_tree):
+    """
+    スライドXMLから全ての図形（shape）のspidと要素を辞書として収集する。
+
+    args:
+        slide_tree (lxml.etree._ElementTree): スライドのXMLツリー
+    returns:
+        dict: spidをキー、図形要素を値とする辞書
+    例: {1: <p:sp>...</p:sp>, 2: <p:pic>...</p:pic>, ...}
+    """
     shapes = {}
     for el in slide_tree.xpath("//p:sp | //p:pic | //p:graphicFrame | //p:grpSp", namespaces=NS):
         cNvPr = el.find(".//p:cNvPr", namespaces=NS)
@@ -84,14 +94,28 @@ def collect_shapes(slide_tree):
 
 
 def collect_visibility_events(slide_tree):
+    """
+    スライドXMLから「表示/非表示」アニメーションイベント(spid, visible)のリストを抽出する。
+
+    args:
+        slide_tree (lxml.etree._ElementTree): スライドのXMLツリー
+    returns:
+        list: (spid, visible) のタプルのリスト
+        visible はアニメーション後の状態を示す。True なら表示、False なら非表示を意味する。
+    例: [(1, True), (2, False), (3, True), ...]
+    """
     events = []
     for set_el in slide_tree.xpath("//p:set", namespaces=NS):
         attr_names = set_el.xpath(".//p:attrNameLst/p:attrName/text()", namespaces=NS)
+
+        # style.visibility を変える <p:set> が対象
         if "style.visibility" not in attr_names:
             continue
 
-        spid_attr = set_el.xpath(".//p:spTgt/@spid", namespaces=NS)
-        to_val = set_el.xpath("./p:to/p:strVal/@val", namespaces=NS)
+        spid_attr = set_el.xpath(".//p:spTgt/@spid", namespaces=NS)  # 図形を識別するID
+        to_val = set_el.xpath(
+            "./p:to/p:strVal/@val", namespaces=NS
+        )  # アニメーション後の状態。表示:visible、非表示:hidden。
         if not spid_attr or not to_val:
             continue
 
@@ -100,60 +124,39 @@ def collect_visibility_events(slide_tree):
         except ValueError:
             continue
 
+        # to_val[0] が "hidden" なら visible=False、それ以外は visible=True
         visible = to_val[0] != "hidden"
         events.append((spid, visible))
     return events
 
 
-# def collect_visibility_events(slide_tree):
-#     """
-#     Return list of tuples: (step_serial, spid, visible)
-#     同じ <p:cTn>（＝同時刻）の <p:set> は同じ step_serial を持つ。
-#     """
-#     events = []
-#     ctn_to_serial = {}
-#     step_serial = -1
-
-#     for set_el in slide_tree.xpath("//p:set", namespaces=NS):
-#         # 1) style.visibility を変える <p:set> だけ対象
-#         attr_names = set_el.xpath(".//p:attrNameLst/p:attrName/text()", namespaces=NS)
-#         if "style.visibility" not in attr_names:
-#             continue
-
-#         spid_attr = set_el.xpath(".//p:spTgt/@spid", namespaces=NS)
-#         to_val = set_el.xpath("./p:to/p:strVal/@val", namespaces=NS)
-#         if not spid_attr or not to_val:
-#             continue
-
-#         try:
-#             spid = int(spid_attr[0])
-#         except ValueError:
-#             continue
-#         visible = to_val[0] != "hidden"
-
-#         # 2) 最近傍 <p:cTn> をグループキーに
-#         ctn = set_el.xpath("ancestor::p:cTn[1]", namespaces=NS)
-#         ctn_key = ctn[0].get("id") if ctn and ctn[0].get("id") else id(ctn[0] if ctn else set_el)
-
-#         if ctn_key not in ctn_to_serial:
-#             step_serial += 1
-#             ctn_to_serial[ctn_key] = step_serial
-#         events.append((ctn_to_serial[ctn_key], spid, visible))
-
-#     return events
-
-
 def build_snapshots(shapes, events):
+    """
+    図形の初期状態とイベント列から、各ステップごとの可視状態スナップショットのリストを作成する。
+
+    args:
+        shapes (dict): spidをキーとする図形の辞書
+        events (list): (spid, visible) のタプルのリスト
+    returns:
+        list: 各ステップの可視状態を表す辞書のリスト
+        各辞書は spid をキー、可視状態 (True/False) を値とする。
+    例: [{1: True, 2: False}, {1: True, 2: True}, ...]
+    """
     state = {spid: True for spid in shapes}
     first_seen = {}
+
+    # 初期の可視状態を設定する
     for spid, visible in events:
         if spid not in first_seen:
             first_seen[spid] = visible
-            if visible:  # appears later, so start hidden
+            if visible:
+                # 後から表示されるため、初期状態では非表示にする
                 state[spid] = False
             else:
                 state[spid] = True
     snaps = [copy.deepcopy(state)]
+
+    # イベントに基づいて各shapeの状態を更新
     for spid, visible in events:
         if spid in state:
             state[spid] = visible
@@ -161,32 +164,11 @@ def build_snapshots(shapes, events):
     return snaps
 
 
-# def build_snapshots(shapes, events):
-#     """
-#     events: [(step_serial, spid, visible), …]  で昇順に並んでいる前提。
-#     """
-#     state = {spid: True for spid in shapes}
-
-#     #  「visible=True が 1 度でも登場するなら step0 で隠す」
-#     appears_later = set(spid for _, spid, vis in events if vis)
-#     for spid in appears_later:
-#         state[spid] = False
-
-#     snapshots = [copy.deepcopy(state)]  # step0（初期）
-
-#     current_step = -1
-#     for step_serial, spid, visible in events:
-#         if step_serial != current_step:
-#             if current_step != -1:  # -1 は初期
-#                 snapshots.append(copy.deepcopy(state))
-#             current_step = step_serial
-#         state[spid] = visible
-
-#     snapshots.append(copy.deepcopy(state))  # 最終状態
-#     return snapshots
-
-
 def materialise_snapshot(orig_tree, visible_map):
+    """
+    指定した可視状態(visible_map)に従い、スライドXMLから非表示図形を除去した新しいツリーを返す。
+    アニメーション情報も削除する。
+    """
     tree = copy.deepcopy(orig_tree)
     # Remove timing for static slide
     timing = tree.find(".//p:timing", namespaces=NS)
@@ -212,6 +194,9 @@ def materialise_snapshot(orig_tree, visible_map):
 # Main processing                                                             #
 # --------------------------------------------------------------------------- #
 def main():
+    """
+    PPTXファイルを展開し、各スライドのアニメーションを静的スライドに分割して新しいPPTXを作成するメイン処理。
+    """
     if not Path(INPUT_PPTX).is_file():
         raise FileNotFoundError(f'"{INPUT_PPTX}" not found')
 
@@ -232,10 +217,10 @@ def main():
         pres_rels_tree = ET.parse(pres_rels_path)
         pres_rels_root = pres_rels_tree.getroot()
 
-        # Map relId -> (target, type)
+        # プレゼンテーションのリレーションシップ(スライド, 画像などのパス)を収集
         relinfo = {rel.get("Id"): (rel.get("Target"), rel.get("Type")) for rel in pres_rels_root}
 
-        # Determine current max slide number
+        # リレーションに新しいスライドを追加する用の最大スライド番号を取得(連番)
         max_slide_num = 0
         for tgt, typ in relinfo.values():
             if typ.endswith("/slide"):
@@ -244,20 +229,21 @@ def main():
                     num = int(m.group(1))
                     max_slide_num = max(max_slide_num, num)
 
-        # Determine current max sldId id
+        # スライドに関連付けられたIDの最大値を取得(連番)
         max_sldId = max(int(el.get("id")) for el in sldIdLst)
 
         for sldId in list(sldIdLst):
             relId = sldId.get(f'{{{NS["r"]}}}id')
             tgt, typ = relinfo[relId]
             if not typ.endswith("/slide"):
-                continue  # only process slide parts
+                continue  # スライドのみを処理対象とする
 
             slide_path = slides_dir / Path(tgt).name
             slide_tree = ET.parse(slide_path)
             shapes = collect_shapes(slide_tree)
             events = collect_visibility_events(slide_tree)
 
+            # スライドにアニメーションがない場合は、可視状態スナップショットをそのまま保存
             if not events:
                 static = materialise_snapshot(slide_tree, {spid: True for spid in shapes})
                 static.write(slide_path, encoding="utf-8", xml_declaration=True)
@@ -265,9 +251,10 @@ def main():
 
             snapshots = build_snapshots(shapes, events)
 
-            # Replace original with first snapshot
+            # 当該スライドを最初のスナップショットで静的スライドに置き換える
             materialise_snapshot(slide_tree, snapshots[0]).write(slide_path, encoding="utf-8", xml_declaration=True)
 
+            # TODO:次はここから。どのようにしてページ番号を設定し、スライドの後ろに追加しているのかを整理する。
             orig_rels_path = rels_dir / f"{slide_path.name}.rels"
             for visible in snapshots[1:]:
                 max_slide_num += 1
